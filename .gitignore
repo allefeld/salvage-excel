@@ -1,0 +1,14 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+test/
+docs/
+.directory
+uv.lock
+*.csv
+*.json
+*.parquet
