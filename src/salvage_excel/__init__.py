@@ -98,8 +98,8 @@ def read_workbook(zf):
         nonlocal epoch
         if name == "sheet":
             sheet_names.append(attrs["name"])
-        if name == "workbookPr":
-            if attrs.get("date1904", "0").lower() in ("1", "true"):
+        if (name == "workbookPr"
+            and attrs.get("date1904", "0").lower() in ("1", "true")):
                 epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
 
     p = ParserCreate()
@@ -149,17 +149,15 @@ def read_shared_strings(zf):
 
 
 def classify_format(format_code):
-    """Classify an Excel format code as 'number', 'date', 'time', or 'datetime'."""
+    """Classify an Excel format code as 'number', 'date', 'time',
+    or 'datetime'."""
     format_code = format_code.lower()
     # Check for date components (respecting m context)
     has_year = bool(search(r"(?<!y)y{2,4}(?!y)", format_code))
     has_day = bool(search(r"(?<![a-z])d{1,2}(?![a-z])", format_code))
     # Month: m not in minute context
-    has_month = False
-    if search(r"(?<![a-z])m{1,2}(?![a-z])", format_code):
-        # Exclude if this m is used as minute (follows h or precedes s)
-        if not search(r"[h\]]:m|m:[s]", format_code):
-            has_month = True
+    has_month = (search(r"(?<![a-z])m{1,2}(?![a-z])", format_code)
+                 and not search(r"[h\]]:m|m:[s]", format_code))
     has_date = has_year or has_month or has_day
     # Check for clock time (h or hh, not [h])
     has_time = bool(search(r"(?<!\[)h{1,2}(?!\])", format_code))
@@ -221,7 +219,7 @@ def read_number_types(zf):
 
 def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
                   epoch=None, prefer_formula=True, debug=False):
-    """Stream worksheet XML, write CSV rows, return (first_row_contents, first_row_types, datatype_counts)."""
+    """Parse worksheet XML, write CSV rows."""
     sri = None              # start row index
     sci = None              # start column index
     eri = None              # end row index
@@ -260,7 +258,7 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
                 sri, sci = cell_index(start)
                 eri, eci = cell_index(end)
                 print(f"  Range {dim}, {eri - sri + 1} × {eci - sci + 1}")
-                dtc = [dict() for _ in range(eci - sci + 1)]
+                dtc = [{} for _ in range(eci - sci + 1)]
             case "row":
                 crc = [""] * (eci - sci + 1)
                 crt = [DT.missing] * (eci - sci + 1)
@@ -346,7 +344,8 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
         ccd += data
 
     def format_cell():
-        # Convert an Excel cell value to a CSV-safe string based on cell type and formatting.
+        # Convert an Excel cell value to a CSV-safe string
+        # based on cell type and formatting.
         match cct:
             case "inlineStr":
                 # inline string
@@ -392,7 +391,7 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
                 # attribute s specifies formatting and thereby number type
                 if cvc is None:
                     return DT.empty, ""
-                if ccs is None:
+                if ccs is None:                                  # noqa: SIM108
                     # default number type
                     nt = "number"
                 else:
@@ -452,7 +451,9 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
                             time = time.rstrip("0")
                         return DT.datetime, date + "T" + time
                     case _:
-                        RuntimeError(f"Unexpected number type attribute {nt}")
+                        raise RuntimeError(
+                            f"Unexpected number type attribute {nt}"
+                        )
             case _:
                 raise RuntimeError(f"Unexpected cell t attribute {cct}")
 
@@ -472,13 +473,13 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
 
 
 def guess_schema(first_row_contents, first_row_types, datatype_counts):
-    """Infer column names, detect headers, and determine common data type per column."""
+    """Infer column names and determine common data type per column."""
     print()
     print("Guessing schema")
 
     # is first row interpretable as column names?
-    is_first_row_cols = all([ht in [DT.string, DT.empty, DT.missing]
-                             for ht in first_row_types])
+    is_first_row_cols = all(ht in [DT.string, DT.empty, DT.missing]
+                             for ht in first_row_types)
     print("First row: ", end="")
     print("column names" if is_first_row_cols else "data")
 
@@ -524,7 +525,7 @@ def guess_schema(first_row_contents, first_row_types, datatype_counts):
     print("Column data types")
     datatypes = set().union(*datatype_counts)
     # table header
-    cnl = max(4, max([len(cn) for cn in col_names]))
+    cnl = max(4, max(len(cn) for cn in col_names))
     print(f"  {'name':{cnl}}", end="")
     for dt in sorted(datatypes):
         print(f" {dt.name:>8}", end="")
@@ -557,8 +558,8 @@ def process_excel(excel_path, sheet_name, csv_path, json_path,
         if sheet_name is None:
             print()
             print("Select a sheet to process:")
-            for sheet_name in sheet_names:
-                print(f"  '{sheet_name}'")
+            for sn in sheet_names:
+                print(f"  '{sn}'")
             print()
             exit(0)
 
@@ -641,9 +642,9 @@ def process_csv(csv_path, json_path, parquet_path):
     print(f"Reading CSV file '{csv_path}' using JSON options '{json_path}'")
     print(f"Writing Parquet file '{parquet_path}'")
     # read options for csv.open_csv from JSON file
-    with open(json_path, "r", encoding="utf-8", newline="\n") as json_file:
+    with open(json_path, encoding="utf-8", newline="\n") as json_file:
         csv_options = load(json_file)
-    with csv.open_csv(
+    with csv.open_csv(                                           # noqa: SIM117
         csv_path,
         csv.ReadOptions(**csv_options["read_options"]),
         csv.ParseOptions(**csv_options["parse_options"]),
@@ -657,7 +658,7 @@ def process_csv(csv_path, json_path, parquet_path):
 
 
 def process(excel_filename, sheet_name, prefer_formula=False, debug=False):
-    """Orchestrate the full pipeline: Excel → CSV → Parquet, skipping Excel parse if CSV exists."""
+    """Orchestrate the full pipeline: Excel → CSV → Parquet."""
     print()
     print("Salvaging Excel data")
 
