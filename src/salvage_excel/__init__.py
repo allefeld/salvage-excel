@@ -21,7 +21,6 @@ def col_index(col):
         result = result * 26 + (ord(c) - ord("A") + 1)
     return result - 1
 
-
 def cell_index(ref):
     """Convert a cell reference like 'AZ16' to (row, col) 0-based indices."""
     m = fullmatch(r"([A-Z]+)(\d+)", ref)
@@ -40,6 +39,7 @@ def index_col(index):
 warning_counts = {}
 
 def warn(general, specific=""):
+    """Print warning, suppressing after 20 occurrences of the same type."""
     count = warning_counts.get(general, 0)
     if count < 20:
         print(f"  Warning: {general} {specific}")
@@ -49,7 +49,7 @@ def warn(general, specific=""):
 
 
 class DT(IntEnum):
-    # value reflects preference
+    """Excel cell datatypes, value reflects preference"""
     number   = 1
     boolean  = 2
     date     = 3
@@ -61,17 +61,167 @@ class DT(IntEnum):
     empty    = 9
     missing  = 10
 
-def process_sheet(
-        zf,
-        sheet_index,
-        cf,
-        shared_strings=[],
-        epoch = None,
-        prefer_formula=True,
-        number_types=[],
-        debug=False
-    ):
+# for each data type, as which other data types it can be read
+COMPAT = {
+    DT.number:   {DT.number, DT.string},
+    DT.boolean:  {DT.boolean, DT.string},
+    DT.date:     {DT.date, DT.datetime, DT.string},
+    DT.time:     {DT.time, DT.string},
+    DT.datetime: {DT.datetime, DT.string},
+    DT.string:   {DT.string},
+    DT.formula:  {DT.string},
+    DT.error:    {DT.string},
+    DT.empty:    {DT.number, DT.boolean, DT.date, DT.time, DT.datetime,
+                  DT.string},
+    DT.missing:  {DT.number, DT.boolean, DT.date, DT.time, DT.datetime,
+                  DT.string}
+}
 
+# for each data type, the corresponding Arrow data type
+ARROW = {
+    DT.number:   "double",
+    DT.boolean:  "bool",
+    DT.date:     "date32[day]",
+    DT.time:     "time64[ns]",
+    DT.datetime: "timestamp[us]",
+    DT.string:   "string",
+    DT.missing:  "null"
+}
+
+
+def read_workbook(zf):
+    """Return a list of sheet names and the epoch for dates."""
+    sheet_names = []
+    epoch = datetime(1899, 12, 30, tzinfo=timezone.utc)
+
+    def start_element(name, attrs):
+        nonlocal epoch
+        if name == "sheet":
+            sheet_names.append(attrs["name"])
+        if name == "workbookPr":
+            if attrs.get("date1904", "0").lower() in ("1", "true"):
+                epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
+
+    p = ParserCreate()
+    p.StartElementHandler = start_element
+    p.ParseFile(zf.open("xl/workbook.xml"))
+    return (sheet_names, epoch)
+
+
+def read_shared_strings(zf):
+    """Parse xl/sharedStrings.xml and return list of shared string values."""
+
+    shared_strings = []
+    csd = None              # current si contents
+    ccd = ""                # current character data
+
+    def start_element(name, attrs):
+        nonlocal csd, ccd
+        match name:
+            case "si":
+                csd = ""
+            case "t":
+                ccd = ""
+
+    def end_element(name):
+        nonlocal csd
+        match name:
+            case "si":
+                shared_strings.append(csd)
+            case "t":
+                csd += ccd
+
+    def character_data(data):
+        nonlocal ccd
+        ccd += data
+
+    p = ParserCreate()
+    p.StartElementHandler  = start_element
+    p.EndElementHandler    = end_element
+    p.CharacterDataHandler = character_data
+    try:
+        p.ParseFile(zf.open("xl/sharedStrings.xml"))
+    except KeyError:
+        warn("Unable to parse 'xl/sharedStrings.xml'.")
+        return []
+
+    return shared_strings
+
+
+def classify_format(format_code):
+    """Classify an Excel format code as 'number', 'date', 'time', or 'datetime'."""
+    format_code = format_code.lower()
+    # Check for date components (respecting m context)
+    has_year = bool(search(r"(?<!y)y{2,4}(?!y)", format_code))
+    has_day = bool(search(r"(?<![a-z])d{1,2}(?![a-z])", format_code))
+    # Month: m not in minute context
+    has_month = False
+    if search(r"(?<![a-z])m{1,2}(?![a-z])", format_code):
+        # Exclude if this m is used as minute (follows h or precedes s)
+        if not search(r"[h\]]:m|m:[s]", format_code):
+            has_month = True
+    has_date = has_year or has_month or has_day
+    # Check for clock time (h or hh, not [h])
+    has_time = bool(search(r"(?<!\[)h{1,2}(?!\])", format_code))
+    # combine
+    if has_date and has_time:
+        return "datetime"
+    elif has_date:
+        return "date"
+    elif has_time:
+        return "time"
+    else:
+        return "number"
+
+
+BUILTIN_DATE_IDS = set(range(14, 18)) | set(range(27, 37)) | set(range(50, 59))
+BUILTIN_TIME_IDS = set(range(18, 22))
+BUILTIN_DATETIME_IDS = {22}
+
+def read_number_types(zf):
+    """Return a list which maps from cells' s attributes to number types."""
+
+    number_formats = {}
+    in_cellXfs = False
+    number_types = []
+
+    def start_element(name, attrs):
+        nonlocal number_formats, in_cellXfs, number_types
+        match name:
+            case "numFmt":
+                id = int(attrs["numFmtId"])
+                number_formats[id] = attrs["formatCode"]
+            case "cellXfs":
+                in_cellXfs = True
+            case "xf":
+                if in_cellXfs:
+                    id = int(attrs["numFmtId"])
+                    if id in BUILTIN_DATE_IDS:
+                        number_type = "date"
+                    elif id in BUILTIN_TIME_IDS:
+                        number_type = "time"
+                    elif id in BUILTIN_DATETIME_IDS:
+                        number_type = "datetime"
+                    elif id in number_formats:
+                        number_type = classify_format(number_formats[id])
+                    else:
+                        number_type = "number"
+                    number_types.append(number_type)
+
+    p = ParserCreate()
+    p.StartElementHandler  = start_element
+    try:
+        p.ParseFile(zf.open("xl/styles.xml"))
+    except KeyError:
+        warn("Unable to parse 'xl/styles.xml'.")
+        return []
+
+    return number_types
+
+
+def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
+                  epoch=None, prefer_formula=True, debug=False):
+    """Stream worksheet XML, write CSV rows, return (first_row_contents, first_row_types, datatype_counts)."""
     sri = None              # start row index
     sci = None              # start column index
     eri = None              # end row index
@@ -196,6 +346,7 @@ def process_sheet(
         ccd += data
 
     def format_cell():
+        # Convert an Excel cell value to a CSV-safe string based on cell type and formatting.
         match cct:
             case "inlineStr":
                 # inline string
@@ -320,32 +471,8 @@ def process_sheet(
     return frc, frt, dtc
 
 
-# for each data type, as which other data types it can be read
-compatible = {
-    DT.number:   {DT.number, DT.string},
-    DT.boolean:  {DT.boolean, DT.string},
-    DT.date:     {DT.date, DT.datetime, DT.string},
-    DT.time:     {DT.time, DT.string},
-    DT.datetime: {DT.datetime, DT.string},
-    DT.string:   {DT.string},
-    DT.formula:  {DT.string},
-    DT.error:    {DT.string},
-    DT.empty:    {DT.number, DT.boolean, DT.date, DT.time, DT.datetime, DT.string},
-    DT.missing:  {DT.number, DT.boolean, DT.date, DT.time, DT.datetime, DT.string}
-}
-
-# for each data type, the corresponding Arrow data type
-arrow = {
-    DT.number:   "double",
-    DT.boolean:  "bool",
-    DT.date:     "date32[day]",
-    DT.time:     "time64[ns]",
-    DT.datetime: "timestamp[us]",
-    DT.string:   "string",
-    DT.missing:  "null"
-}
-
 def guess_schema(first_row_contents, first_row_types, datatype_counts):
+    """Infer column names, detect headers, and determine common data type per column."""
     print()
     print("Guessing schema")
 
@@ -387,11 +514,9 @@ def guess_schema(first_row_contents, first_row_types, datatype_counts):
 
     # for each column, determine best common data type
     common_datatype = [
-        min(
-            set.intersection(*(
-                compatible[key] for key in datatype_counts[ci]
-            ))
-        )
+        min(set.intersection(*(
+                COMPAT[key] for key in datatype_counts[ci]
+        )))
         for ci in range(num_cols)
     ]
 
@@ -408,7 +533,7 @@ def guess_schema(first_row_contents, first_row_types, datatype_counts):
     for ci in range(num_cols):
         print(f"  {col_names[ci]:{cnl}}", end="")
         for dt in sorted(datatypes):
-            if dt in datatype_counts[ci]: 
+            if dt in datatype_counts[ci]:
                 print(f" {datatype_counts[ci][dt]:8}", end="")
             else:
                 print(f" {'·':>8}", end="")
@@ -416,136 +541,10 @@ def guess_schema(first_row_contents, first_row_types, datatype_counts):
 
     return is_first_row_cols, col_names, common_datatype
 
-def read_workbook(zf):
-    """Return a list of sheet names and the epoch for dates."""
-    sheet_names = []
-    epoch = datetime(1899, 12, 30, tzinfo=timezone.utc)
-
-    def start_element(name, attrs):
-        nonlocal epoch
-        if name == "sheet":
-            sheet_names.append(attrs["name"])
-        if name == "workbookPr":
-            if attrs.get("date1904", "0").lower() in ("1", "true"):
-                epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
-
-    p = ParserCreate()
-    p.StartElementHandler = start_element
-    p.ParseFile(zf.open("xl/workbook.xml"))
-    return (sheet_names, epoch)
-
-
-def read_shared_strings(zf):
-    """Return a list of sheet names."""
-
-    shared_strings = []
-    csd = None              # current si contents
-    ccd = ""                # current character data
-
-    def start_element(name, attrs):
-        nonlocal csd, ccd
-        match name:
-            case "si":
-                csd = ""
-            case "t":
-                ccd = ""
-
-    def end_element(name):
-        nonlocal csd
-        match name:
-            case "si":
-                shared_strings.append(csd)
-            case "t":
-                csd += ccd
-
-    def character_data(data):
-        nonlocal ccd
-        ccd += data
-
-    p = ParserCreate()
-    p.StartElementHandler  = start_element
-    p.EndElementHandler    = end_element
-    p.CharacterDataHandler = character_data
-    try:
-        p.ParseFile(zf.open("xl/sharedStrings.xml"))
-    except KeyError:
-        warn("Unable to parse 'xl/sharedStrings.xml'.")
-        return []
-
-    return shared_strings
-
-
-def classify_format(format_code):
-    format_code = format_code.lower()
-    # Check for date components (respecting m context)
-    has_year = bool(search(r"(?<!y)y{2,4}(?!y)", format_code))
-    has_day = bool(search(r"(?<![a-z])d{1,2}(?![a-z])", format_code))
-    # Month: m not in minute context
-    has_month = False
-    if search(r"(?<![a-z])m{1,2}(?![a-z])", format_code):
-        # Exclude if this m is used as minute (follows h or precedes s)
-        if not search(r"[h\]]:m|m:[s]", format_code):
-            has_month = True
-    has_date = has_year or has_month or has_day
-    # Check for clock time (h or hh, not [h])
-    has_time = bool(search(r"(?<!\[)h{1,2}(?!\])", format_code))
-    # combine
-    if has_date and has_time:
-        return "datetime"
-    elif has_date:
-        return "date"
-    elif has_time:
-        return "time"
-    else:
-        return "number"
-
-BUILTIN_DATE_IDS = set(range(14, 18)) | set(range(27, 37)) | set(range(50, 59))
-BUILTIN_TIME_IDS = set(range(18, 22))
-BUILTIN_DATETIME_IDS = {22}
-
-def read_number_types(zf):
-    """Return a list which maps from cells' s attributes to number types."""
-
-    number_formats = {}
-    in_cellXfs = False
-    number_types = []
-
-    def start_element(name, attrs):
-        nonlocal number_formats, in_cellXfs, number_types
-        match name:
-            case "numFmt":
-                id = int(attrs["numFmtId"])
-                number_formats[id] = attrs["formatCode"]
-            case "cellXfs":
-                in_cellXfs = True
-            case "xf":
-                if in_cellXfs:
-                    id = int(attrs["numFmtId"])
-                    if id in BUILTIN_DATE_IDS:
-                        number_type = "date"
-                    elif id in BUILTIN_TIME_IDS:
-                        number_type = "time"
-                    elif id in BUILTIN_DATETIME_IDS:
-                        number_type = "datetime"
-                    elif id in number_formats:
-                        number_type = classify_format(number_formats[id])
-                    else:
-                        number_type = "number"
-                    number_types.append(number_type)
-
-    p = ParserCreate()
-    p.StartElementHandler  = start_element
-    try:
-        p.ParseFile(zf.open("xl/styles.xml"))
-    except KeyError:
-        warn("Unable to parse 'xl/styles.xml'.")
-        return []
-
-    return number_types
-
 
 def process_excel(excel_path, sheet_name, csv_path, json_path,
                   prefer_formula=True, debug=False):
+    """Parse xlsx file and write CSV + JSON schema options to disk."""
     with ZipFile(excel_path) as excel_file:
         # get sheet names
         sheet_names, epoch = read_workbook(excel_file)
@@ -617,7 +616,7 @@ def process_excel(excel_path, sheet_name, csv_path, json_path,
         },
         "convert_options": {
             "column_types": {
-                col_names[ci]: arrow[common_datatype[ci]]
+                col_names[ci]: ARROW[common_datatype[ci]]
                 for ci in range(len(col_names))
             },
             "true_values": ["TRUE"],
@@ -637,6 +636,7 @@ def process_excel(excel_path, sheet_name, csv_path, json_path,
 
 
 def process_csv(csv_path, json_path, parquet_path):
+    """Read CSV with PyArrow schema from JSON options and write Parquet."""
     print()
     print(f"Reading CSV file '{csv_path}' using JSON options '{json_path}'")
     print(f"Writing Parquet file '{parquet_path}'")
@@ -656,8 +656,8 @@ def process_csv(csv_path, json_path, parquet_path):
     print(f"Wrote {bi + 1} batches")
 
 
-
 def process(excel_filename, sheet_name, prefer_formula=False, debug=False):
+    """Orchestrate the full pipeline: Excel → CSV → Parquet, skipping Excel parse if CSV exists."""
     print()
     print("Salvaging Excel data")
 
@@ -674,6 +674,8 @@ def process(excel_filename, sheet_name, prefer_formula=False, debug=False):
         exit(1)
 
     if not csv_path.exists():
+        # Idempotency: if CSV exists, skip Excel parsing. User can edit CSV
+        # and rerun to regenerate Parquet without re-parsing the Excel file.
         if json_path.exists():
             print()
             print(f"Error: CSV file '{csv_path}' does not exist, "
@@ -709,6 +711,7 @@ def process(excel_filename, sheet_name, prefer_formula=False, debug=False):
 
 
 def main():
+    """CLI entry point."""
     parser = ArgumentParser(
         description="Salvage Excel data"
     )
