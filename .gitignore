@@ -12,3 +12,5 @@ uv.lock
 *.csv
 *.json
 *.parquet
+memory/
+CLAUDE.md

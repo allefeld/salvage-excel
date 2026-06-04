@@ -1,3 +1,74 @@
 # salvage-excel
 
-Salvage Excel data
+Salvage data from messy Excel files to Parquet.
+
+## Purpose
+
+Standard Excel readers (pandas, R, etc.) can struggle with real-world `.xlsx` files:
+
+- **Auto-converted input**: Excel turns some user-entered strings `"+2"` into formulas, and readers may return the "value" (often an error code) instead of the intended string.
+- **Large files**: Loading entire files into memory can make Excel and similar programs like LibreOffice Calc unresponsive, so correcting errors in Excel becomes hard.
+- **Data corruption**: Complex formatting or unusual structures sometimes cause readers to fail or silently lose data.
+
+`salvage-excel` bypasses standard readers by reading the internal XML directly. It converts via an intermediate CSV (data) + JSON (schema) representation, enabling manual inspection and correction.
+
+## Installation
+
+Requires Python ≥ 3.10.
+
+**Option 1: Install with pipx**
+
+```bash
+pipx install git+https://github.com/allefeld/salvage-excel
+```
+
+**Option 2: Install with uv tool**
+
+```bash
+uv tool install git+https://github.com/allefeld/salvage-excel
+```
+
+**Option 3: Clone and sync**
+
+```bash
+git clone <repo>
+cd salvage-excel
+uv sync
+```
+
+Then use `uv run salvage-excel` to run the repository version.
+
+## Usage
+
+```bash
+# List sheets in an Excel file
+salvage-excel data.xlsx
+
+# Convert a sheet to Parquet
+salvage-excel data.xlsx "Sheet1"
+
+# Use cached cell values instead of formula text
+salvage-excel data.xlsx "Sheet1" --prefer-cached
+```
+
+The tool first creates two output files for each sheet
+
+- `data-Sheet1.csv` — raw data extracted from Excel
+- `data-Sheet1.json` — inferred schema and PyArrow options
+
+and then converts these into
+
+- `data-Sheet1.parquet` — final Parquet output
+
+## Workflow
+
+1. Convert an Excel file's sheet.
+2. Inspect output and intermediate CSV and schema for issues.
+3. If necessary, correct intermediate CSV and schema.
+4. Re-run the tool to regenerate the Parquet with your corrections.
+
+The pipeline is idempotent: if the CSV already exists, the tool skips Excel parsing and goes straight to Parquet conversion, making it fast to iterate on schema fixes.
+
+---
+
+This software is copyrighted © 2026 by Carsten Allefeld and released under the terms of the GNU General Public License, version 3 or later.

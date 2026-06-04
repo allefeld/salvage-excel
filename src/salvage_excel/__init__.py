@@ -5,8 +5,8 @@ from functools import lru_cache
 from json import dump, load
 from pathlib import Path
 from re import fullmatch, search
-from sys import stderr, exit
-from time import strftime, gmtime, time
+from sys import exit, stderr
+from time import gmtime, strftime, time
 from xml.parsers.expat import ParserCreate
 from zipfile import ZipFile
 
