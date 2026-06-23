@@ -242,6 +242,7 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
     frc = None              # first row contents
     frt = None              # first row data types
     level = 0               # indentation for debug output
+    lastrep = time()        # last time of progress report
 
     def start_element(name, attrs):
         nonlocal level
@@ -295,7 +296,7 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
         level += 1
 
     def end_element(name):
-        nonlocal level, cvc, cfc, cic, ori, frc, frt
+        nonlocal level, cvc, cfc, cic, ori, frc, frt, lastrep
         match name:
             case "row":
                 # write row to csv
@@ -308,10 +309,12 @@ def process_sheet(zf, sheet_index, cf, shared_strings, number_types,
                     # other rows: count datatypes
                     for ci, dt in enumerate(crt):
                         dtc[ci][dt] = dtc[ci].get(dt, 0) + 1
-                # update row number and report
+                # update row number
                 ori += 1
-                if ori % 100 == 0:
+                # progress report
+                if time() - lastrep > 0.05:
                     print(f"  {ori}", end="\r")
+                    lastrep = time()
             case "c":
                 if prefer_formula and cfc is not None:
                     warn(
